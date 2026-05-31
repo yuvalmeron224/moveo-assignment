@@ -5,7 +5,7 @@ tools.py — 4 כלים + router.
 import os
 import json
 from dotenv import load_dotenv
-from database import query, write, POLICY_MIN_YEAR
+from database import query, write, POLICY_MIN_YEAR, ensure_reservations_table, is_postgres
 from vector_store import search_knowledge_base
 
 load_dotenv()
@@ -79,6 +79,23 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "check_reservation_status",
+        "description": (
+            "Call this when a customer wants to BUY a specific car but it has no available units. "
+            "Checks whether any active reservations exist — a reserved car may become available "
+            "if the reservation holder does not complete their purchase within the hold period. "
+            "Returns the time remaining until the earliest reservation expires, so you can tell "
+            "the customer when the car might become available again."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "car_id": {"type": "integer", "description": "Vehicle ID to check"},
+            },
+            "required": ["car_id"],
+        },
+    },
+    {
         "name": "send_purchase_email",
         "description": (
             "Send a purchase inquiry email to the sales team. "
@@ -134,8 +151,19 @@ def _search_inventory(make=None, model=None, year_min=None,
     except Exception as e:
         return {"success": False, "error": "database_unavailable", "results": []}
 
+    # Count active reservations per car (expires_at > NOW)
+    now_fn  = "NOW()" if is_postgres() else "datetime('now')"
+    res_rows = query(
+        f"SELECT car_id, COUNT(*) as cnt FROM reservations "
+        f"WHERE expires_at > {now_fn} GROUP BY car_id"
+    )
+    active_reservations = {r["car_id"]: r["cnt"] for r in res_rows}
+
     results = []
     for car in rows:
+        reserved_units   = active_reservations.get(car["id"], 0)
+        available_units  = car["stock_count"] - reserved_units
+
         if car["year"] < POLICY_MIN_YEAR:
             car["sellable"]    = False
             car["status"]      = "pending_delisting"
@@ -143,14 +171,18 @@ def _search_inventory(make=None, model=None, year_min=None,
                 f"Year {car['year']} is below the {POLICY_MIN_YEAR}+ sales policy. "
                 "Cannot be sold, reserved, or delivered."
             )
-        elif car["stock_count"] <= 0:
+        elif available_units <= 0:
             car["sellable"]    = False
-            car["status"]      = "out_of_stock"
-            car["status_note"] = "Out of stock — cannot be reserved."
+            car["status"]      = "out_of_stock" if car["stock_count"] <= 0 else "fully_reserved"
+            car["status_note"] = (
+                "Out of stock — cannot be reserved."
+                if car["stock_count"] <= 0
+                else "All units currently reserved — check back later."
+            )
         else:
-            car["sellable"]    = True
-            car["status"]      = "available"
-            car["status_note"] = None
+            car["sellable"]         = True
+            car["status"]           = "available"
+            car["status_note"]      = None
         results.append(car)
 
     return {"success": True, "count": len(results), "results": results}
@@ -161,6 +193,8 @@ def _search_knowledge_base(query: str) -> dict:
 
 
 def _reserve_car(car_id: int, user_name: str, user_email: str) -> dict:
+    ensure_reservations_table()
+
     try:
         rows = query("SELECT * FROM vehicles WHERE id = ?", [car_id])
     except Exception:
@@ -171,7 +205,7 @@ def _reserve_car(car_id: int, user_name: str, user_email: str) -> dict:
 
     car = rows[0]
 
-    # Policy check — בקוד, לא ב-prompt
+    # Policy check — in code, not prompt
     if car["year"] < POLICY_MIN_YEAR:
         return {
             "success": False,
@@ -179,38 +213,103 @@ def _reserve_car(car_id: int, user_name: str, user_email: str) -> dict:
             "reason":  f"Year {car['year']} does not meet the {POLICY_MIN_YEAR}+ policy.",
         }
 
-    # Fast pre-check (avoids unnecessary DB write on clearly empty stock)
     if car["stock_count"] <= 0:
         return {"success": False, "error": "out_of_stock"}
 
-    # Atomic stock decrement — prevents race condition where two concurrent
-    # reservations both pass the check above and both write, causing stock=-1.
-    # The WHERE stock_count > 0 guard means only one writer can succeed.
+    # Count active reservations — lazy expiry: expired rows are simply not counted
+    now_fn = "NOW()" if is_postgres() else "datetime('now')"
+    active = query(
+        f"SELECT COUNT(*) as cnt FROM reservations "
+        f"WHERE car_id = ? AND expires_at > {now_fn}",
+        [car_id],
+    )[0]["cnt"]
+
+    if active >= car["stock_count"]:
+        return {"success": False, "error": "out_of_stock"}
+
+    # Insert reservation — expires in 72 hours
+    hours_fn = (
+        "NOW() + INTERVAL '72 hours'" if is_postgres()
+        else "datetime('now', '+72 hours')"
+    )
     try:
         write(
-            "UPDATE vehicles SET stock_count = stock_count - 1 WHERE id = ? AND stock_count > 0",
-            [car_id],
+            f"INSERT INTO reservations (car_id, user_name, user_email, expires_at) "
+            f"VALUES (?, ?, ?, {hours_fn})",
+            [car_id, user_name, user_email],
         )
-        new_stock = query("SELECT stock_count FROM vehicles WHERE id = ?", [car_id])[0]["stock_count"]
     except Exception:
         return {"success": False, "error": "database_unavailable"}
 
-    # If stock didn't decrease, another request won the race
-    if new_stock >= car["stock_count"]:
-        return {"success": False, "error": "out_of_stock"}
+    return {
+        "success":    True,
+        "car_id":     car_id,
+        "make":       car["make"],
+        "model":      car["model"],
+        "year":       car["year"],
+        "price":      car["price"],
+        "user_name":  user_name,
+        "user_email": user_email,
+        "held_hours": 72,
+        "message":    f"Reserved for {user_name} — held 72 hours.",
+    }
+
+
+def _check_reservation_status(car_id: int) -> dict:
+    ensure_reservations_table()
+
+    try:
+        rows = query("SELECT * FROM vehicles WHERE id = ?", [car_id])
+    except Exception:
+        return {"success": False, "error": "database_unavailable"}
+
+    if not rows:
+        return {"success": False, "error": "car_not_found"}
+
+    car = rows[0]
+
+    # Fetch active reservations with time remaining
+    if is_postgres():
+        reservations = query(
+            "SELECT expires_at, "
+            "EXTRACT(EPOCH FROM (expires_at - NOW()))::int AS seconds_remaining "
+            "FROM reservations WHERE car_id = ? AND expires_at > NOW() "
+            "ORDER BY expires_at ASC",
+            [car_id],
+        )
+    else:
+        reservations = query(
+            "SELECT expires_at, "
+            "CAST((strftime('%s', expires_at) - strftime('%s', 'now')) AS INTEGER) AS seconds_remaining "
+            "FROM reservations WHERE car_id = ? AND expires_at > datetime('now') "
+            "ORDER BY expires_at ASC",
+            [car_id],
+        )
+
+    if not reservations:
+        return {
+            "success":                True,
+            "car_id":                 car_id,
+            "make":                   car["make"],
+            "model":                  car["model"],
+            "has_active_reservations": False,
+            "message":                "No active reservations — car is permanently out of stock.",
+        }
+
+    earliest  = reservations[0]
+    seconds   = max(int(earliest["seconds_remaining"]), 0)
+    hours     = seconds // 3600
+    minutes   = (seconds % 3600) // 60
 
     return {
-        "success":         True,
-        "car_id":          car_id,
-        "make":            car["make"],
-        "model":           car["model"],
-        "year":            car["year"],
-        "price":           car["price"],
-        "user_name":       user_name,
-        "user_email":      user_email,
-        "remaining_stock": new_stock,
-        "held_hours":      72,
-        "message":         f"Reserved for {user_name} — held 72 hours.",
+        "success":                 True,
+        "car_id":                  car_id,
+        "make":                    car["make"],
+        "model":                   car["model"],
+        "has_active_reservations": True,
+        "active_count":            len(reservations),
+        "earliest_release_hours":  hours,
+        "earliest_release_minutes": minutes,
     }
 
 
@@ -251,10 +350,11 @@ def _send_purchase_email(user_name: str, user_email: str,
 # ─── Router ─────────────────────────────────────────────────────────────────
 
 TOOL_MAP = {
-    "search_inventory":      _search_inventory,
-    "search_knowledge_base": _search_knowledge_base,
-    "reserve_car":           _reserve_car,
-    "send_purchase_email":   _send_purchase_email,
+    "search_inventory":        _search_inventory,
+    "search_knowledge_base":   _search_knowledge_base,
+    "reserve_car":             _reserve_car,
+    "check_reservation_status": _check_reservation_status,
+    "send_purchase_email":     _send_purchase_email,
 }
 
 

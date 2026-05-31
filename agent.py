@@ -5,19 +5,19 @@ Claude formats answers — it does not make policy decisions.
 """
 
 import os
+import re
 import json
 import logging
 import unicodedata
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from tools import TOOL_DEFINITIONS, run_tool
-from router import classify
-from analytics import ensure_table, log_classification
 
 load_dotenv()
 
 _client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-ensure_table()   # create router_log table on first run
+
+EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
 
 # ─── Safety constants ────────────────────────────────────────────────────────
 
@@ -54,10 +54,20 @@ STRICT RULES — NEVER VIOLATE UNDER ANY CIRCUMSTANCES:
    These vehicles exist for administrative purposes only. Acknowledge their existence but explain they cannot be sold
    per the 2022+ Sales Policy.
 
-3. NEVER send a purchase email unless BOTH conditions are true:
-   - The customer has clearly and explicitly stated they want to BUY (not just browse, inquire, or ask about price).
-   - You have their email address confirmed in this conversation.
-   If either is missing — ask for it. Do not send.
+3. BEFORE calling reserve_car or send_purchase_email — ALWAYS confirm first.
+   Present a clear summary to the customer and wait for an explicit "yes" before executing.
+
+   For reserve_car, show:
+     - Car: make, model, year, color, price
+     - Hold period: 72 hours
+     - Then ask: "Shall I reserve this for you?" (in their language)
+
+   For send_purchase_email, show:
+     - Car details and price
+     - What will happen next (sales team contact)
+     - Then ask: "Shall I submit your purchase inquiry?" (in their language)
+
+   Only call the tool after the customer confirms. If they say no or hesitate — do not call it.
 
 4. NEVER answer inventory or policy questions from memory. Always use the appropriate tool first.
 
@@ -150,51 +160,15 @@ def chat(user_message: str, history: list) -> tuple[str, list]:
     if not user_message:
         return "I didn't receive a valid message. Please try again.", history
 
-    # 2 — Classify intent (WE decide the route, not Claude)
-    route = classify(user_message, history)
-    logger.info(
-        f"Router → intent={route['intent']} "
-        f"confidence={route.get('confidence','?')} "
-        f"needs_clarification={route.get('needs_clarification', False)}"
-    )
-
-    # 2a — Persist classification for observability
-    log_classification(
-        message       = user_message,
-        intent        = route["intent"],
-        confidence    = route.get("confidence", "medium"),
-        overridden    = route.get("overridden", False),
-        needs_clarify = route.get("needs_clarification", False),
-    )
-
-    # 2b — Purchase intent without email: let Claude handle it.
-    # Claude will search inventory (if no specific car was named), present options,
-    # and ask for an email — all in the customer's language.
-    if route["intent"] == "purchase_intent_no_email":
-        route["tool_choice"] = {"type": "auto"}
-
-    # 3 — Append to history and trim if needed
+    # 2 — Append to history and trim if needed
     history = trim_history(history)
+    history.append({"role": "user", "content": user_message})
 
-    # 3b — Low-confidence: prepend a clarification note so Claude asks the user
-    #      before taking any action. The note is injected into the user turn so
-    #      Claude sees it but the user never does.
-    if route.get("needs_clarification"):
-        logger.info("Low confidence — instructing Claude to clarify intent")
-        clarification_note = (
-            "[SYSTEM NOTE: The user's intent is ambiguous. "
-            "Ask a short, friendly clarifying question to understand exactly what they need "
-            "before searching or taking any action. Do not guess.]"
-        )
-        history.append({"role": "user", "content": f"{clarification_note}\n\n{user_message}"})
-    else:
-        history.append({"role": "user", "content": user_message})
-
-    # 4 — Agent loop with iteration cap
+    # 3 — Agent loop with iteration cap
     for iteration in range(1, MAX_TOOL_ITERS + 1):
         logger.info(f"[iteration {iteration}] Calling Claude")
 
-        tool_choice = route["tool_choice"] if iteration == 1 else {"type": "auto"}
+        tool_choice = {"type": "auto"}
 
         try:
             response = _client.messages.create(
