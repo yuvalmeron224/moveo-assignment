@@ -5,7 +5,7 @@ tools.py
 import os
 import json
 from dotenv import load_dotenv
-from database import query, write, POLICY_MIN_YEAR, ensure_reservations_table, is_postgres
+from database import query, write, POLICY_MIN_YEAR, ensure_reservations_table
 from vector_store import search_knowledge_base
 
 load_dotenv()
@@ -79,23 +79,6 @@ TOOL_DEFINITIONS = [
         },
     },
     {
-        "name": "check_reservation_status",
-        "description": (
-            "Call this when a customer wants to BUY a specific car but it has no available units. "
-            "Checks whether any active reservations exist — a reserved car may become available "
-            "if the reservation holder does not complete their purchase within the hold period. "
-            "Returns the time remaining until the earliest reservation expires, so you can tell "
-            "the customer when the car might become available again."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "car_id": {"type": "integer", "description": "Vehicle ID to check"},
-            },
-            "required": ["car_id"],
-        },
-    },
-    {
         "name": "send_purchase_email",
         "description": (
             "Send a purchase inquiry email to the sales team. "
@@ -152,26 +135,18 @@ def _search_inventory(make=None, model=None, year_min=None,
         return {"success": False, "error": "database_unavailable", "results": []}
 
     # Count active reservations per car (expires_at > NOW)
-    now_fn  = "NOW()" if is_postgres() else "datetime('now')"
     res_rows = query(
-        f"SELECT car_id, COUNT(*) as cnt FROM reservations "
-        f"WHERE expires_at > {now_fn} GROUP BY car_id"
+        "SELECT car_id, COUNT(*) as cnt FROM reservations "
+        "WHERE expires_at > NOW() GROUP BY car_id"
     )
     active_reservations = {r["car_id"]: r["cnt"] for r in res_rows}
 
     # Fetch earliest expiry per fully-reserved car
-    if is_postgres():
-        expiry_rows = query(
-            f"SELECT car_id, "
-            f"EXTRACT(EPOCH FROM (MIN(expires_at) - NOW()))::int AS seconds_remaining "
-            f"FROM reservations WHERE expires_at > NOW() GROUP BY car_id"
-        )
-    else:
-        expiry_rows = query(
-            f"SELECT car_id, "
-            f"CAST((strftime('%s', MIN(expires_at)) - strftime('%s', 'now')) AS INTEGER) AS seconds_remaining "
-            f"FROM reservations WHERE expires_at > datetime('now') GROUP BY car_id"
-        )
+    expiry_rows = query(
+        "SELECT car_id, "
+        "EXTRACT(EPOCH FROM (MIN(expires_at) - NOW()))::int AS seconds_remaining "
+        "FROM reservations WHERE expires_at > NOW() GROUP BY car_id"
+    )
     earliest_release = {r["car_id"]: max(int(r["seconds_remaining"]), 0) for r in expiry_rows}
 
     results = []
@@ -250,10 +225,9 @@ def _reserve_car(car_id: int, user_name: str, user_email: str) -> dict:
         return {"success": False, "error": "out_of_stock"}
 
     # Count active reservations — lazy expiry: expired rows are simply not counted
-    now_fn = "NOW()" if is_postgres() else "datetime('now')"
     active = query(
-        f"SELECT COUNT(*) as cnt FROM reservations "
-        f"WHERE car_id = ? AND expires_at > {now_fn}",
+        "SELECT COUNT(*) as cnt FROM reservations "
+        "WHERE car_id = ? AND expires_at > NOW()",
         [car_id],
     )[0]["cnt"]
 
@@ -261,14 +235,10 @@ def _reserve_car(car_id: int, user_name: str, user_email: str) -> dict:
         return {"success": False, "error": "out_of_stock"}
 
     # Insert reservation — expires in 72 hours
-    hours_fn = (
-        "NOW() + INTERVAL '72 hours'" if is_postgres()
-        else "datetime('now', '+72 hours')"
-    )
     try:
         write(
-            f"INSERT INTO reservations (car_id, user_name, user_email, expires_at) "
-            f"VALUES (?, ?, ?, {hours_fn})",
+            "INSERT INTO reservations (car_id, user_name, user_email, expires_at) "
+            "VALUES (?, ?, ?, NOW() + INTERVAL '72 hours')",
             [car_id, user_name, user_email],
         )
     except Exception:
@@ -285,64 +255,6 @@ def _reserve_car(car_id: int, user_name: str, user_email: str) -> dict:
         "user_email": user_email,
         "held_hours": 72,
         "message":    f"Reserved for {user_name} — held 72 hours.",
-    }
-
-
-def _check_reservation_status(car_id: int) -> dict:
-    ensure_reservations_table()
-
-    try:
-        rows = query("SELECT * FROM vehicles WHERE id = ?", [car_id])
-    except Exception:
-        return {"success": False, "error": "database_unavailable"}
-
-    if not rows:
-        return {"success": False, "error": "car_not_found"}
-
-    car = rows[0]
-
-    # Fetch active reservations with time remaining
-    if is_postgres():
-        reservations = query(
-            "SELECT expires_at, "
-            "EXTRACT(EPOCH FROM (expires_at - NOW()))::int AS seconds_remaining "
-            "FROM reservations WHERE car_id = ? AND expires_at > NOW() "
-            "ORDER BY expires_at ASC",
-            [car_id],
-        )
-    else:
-        reservations = query(
-            "SELECT expires_at, "
-            "CAST((strftime('%s', expires_at) - strftime('%s', 'now')) AS INTEGER) AS seconds_remaining "
-            "FROM reservations WHERE car_id = ? AND expires_at > datetime('now') "
-            "ORDER BY expires_at ASC",
-            [car_id],
-        )
-
-    if not reservations:
-        return {
-            "success":                True,
-            "car_id":                 car_id,
-            "make":                   car["make"],
-            "model":                  car["model"],
-            "has_active_reservations": False,
-            "message":                "No active reservations — car is permanently out of stock.",
-        }
-
-    earliest  = reservations[0]
-    seconds   = max(int(earliest["seconds_remaining"]), 0)
-    hours     = seconds // 3600
-    minutes   = (seconds % 3600) // 60
-
-    return {
-        "success":                 True,
-        "car_id":                  car_id,
-        "make":                    car["make"],
-        "model":                   car["model"],
-        "has_active_reservations": True,
-        "active_count":            len(reservations),
-        "earliest_release_hours":  hours,
-        "earliest_release_minutes": minutes,
     }
 
 
@@ -386,8 +298,7 @@ TOOL_MAP = {
     "search_inventory":        _search_inventory,
     "search_knowledge_base":   _search_knowledge_base,
     "reserve_car":             _reserve_car,
-    "check_reservation_status": _check_reservation_status,
-    "send_purchase_email":     _send_purchase_email,
+"send_purchase_email":     _send_purchase_email,
 }
 
 

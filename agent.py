@@ -71,11 +71,8 @@ STRICT RULES — NEVER VIOLATE UNDER ANY CIRCUMSTANCES:
 
 4. NEVER answer inventory or policy questions from memory. Always use the appropriate tool first.
 
-   Whenever search_inventory returns ANY vehicle with status "fully_reserved" — you MUST call
-   check_reservation_status for that car_id in the same response, before replying to the customer.
-   Then tell the customer: the car is currently held by another buyer, and will be available again
-   in X hours and Y minutes if they do not complete the purchase.
-   Never omit the release time for a fully_reserved vehicle.
+   When search_inventory returns a vehicle with status "fully_reserved", the status_note field
+   already contains the release time. Always include this in your reply to the customer.
 
 5. ALWAYS cite the source document (e.g., "According to our policy") when answering from the knowledge base.
 
@@ -245,32 +242,3 @@ def create_session() -> list:
     return []
 
 
-# ─── Smoke test ──────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    from database import run_migration
-    from vector_store import build_vector_store
-
-    run_migration()
-    build_vector_store()
-
-    print("\n=== Agent smoke test ===\n")
-
-    history = create_session()
-
-    tests = [
-        ("Hybrid RAG",          "Do you have any Tesla electric cars?"),
-        ("Conflict resolution",  "What about a BMW X5 from 2020?"),
-        ("Knowledge base",       "What is your return policy?"),
-        ("Context memory",       "Can I return it within 7 days?"),
-        ("Out of stock",         "Do you have the BMW M5 2024?"),
-    ]
-
-    for label, msg in tests:
-        print(f"[{label}]")
-        print(f"  User  : {msg}")
-        reply, history = chat(msg, history)
-        print(f"  Agent : {reply[:200]}")
-        print()
-
-    print("✓ Smoke test complete")
