@@ -1,23 +1,23 @@
 """
-agent.py — Production-grade agent loop.
+agent.py 
 Business logic lives in code (tools.py), not in prompts.
 Claude formats answers — it does not make policy decisions.
 """
 
 import os
+import re
 import json
 import logging
 import unicodedata
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from tools import TOOL_DEFINITIONS, run_tool
-from router import classify
-from analytics import ensure_table, log_classification
 
 load_dotenv()
 
 _client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-ensure_table()   # create router_log table on first run
+
+EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b')
 
 # ─── Safety constants ────────────────────────────────────────────────────────
 
@@ -44,22 +44,38 @@ STRICT RULES — NEVER VIOLATE UNDER ANY CIRCUMSTANCES:
 1. NEVER describe, invent, or assume vehicle features, specs, or details that are not explicitly present in the tool results.
    If a detail is not in the data returned by a tool — say "I don't have that information."
 
-   The inventory database contains ONLY these fields: make, model, year, price, fuel_type, color, stock status.
+   The inventory database contains ONLY these fields: make, model, year, price, mileage, fuel_type, color, stock status.
+   Mileage is in miles — never convert to km, display it as miles.
    It does NOT contain: horsepower, top speed, acceleration, range, engine size, seating, features, or any other specs.
    NEVER suggest you can search or filter by these missing fields.
-   When a customer asks for a "fast car" or "powerful car" — offer to show performance brands
-   (Ferrari, Lamborghini, Porsche, McLaren, Aston Martin, Bentley) and search by make only.
+   
+2. Pre-2022 vehicles are hidden from search results. NEVER proactively mention them.
+   ONLY if a customer explicitly asks about a specific year below 2022 — acknowledge that units exist
+   but explain they cannot be sold per the 2022+ Sales Policy.
+   Never offer to sell, reserve, or deliver any vehicle with sellable: false or status: pending_delisting.
 
-2. NEVER offer to sell, reserve, or deliver a vehicle with sellable: false or status: pending_delisting.
-   These vehicles exist for administrative purposes only. Acknowledge their existence but explain they cannot be sold
-   per the 2022+ Sales Policy.
+3. BEFORE calling reserve_car or send_purchase_email — ALWAYS confirm first.
+   Present a clear summary to the customer and wait for an explicit "yes" before executing.
 
-3. NEVER send a purchase email unless BOTH conditions are true:
-   - The customer has clearly and explicitly stated they want to BUY (not just browse, inquire, or ask about price).
-   - You have their email address confirmed in this conversation.
-   If either is missing — ask for it. Do not send.
+   For reserve_car, show:
+     - Car: make, model, year, color, price
+     - Hold period: 72 hours
+     - Then ask: "Shall I reserve this for you?" 
+
+   For send_purchase_email, show:
+     - Car details and price
+     - What will happen next (sales team contact)
+     - Then ask: "Shall I submit your purchase inquiry?" 
+
+   Only call the tool after the customer confirms. If they say no or hesitate — do not call it.
 
 4. NEVER answer inventory or policy questions from memory. Always use the appropriate tool first.
+
+   Whenever search_inventory returns ANY vehicle with status "fully_reserved" — you MUST call
+   check_reservation_status for that car_id in the same response, before replying to the customer.
+   Then tell the customer: the car is currently held by another buyer, and will be available again
+   in X hours and Y minutes if they do not complete the purchase.
+   Never omit the release time for a fully_reserved vehicle.
 
 5. ALWAYS cite the source document (e.g., "According to our policy") when answering from the knowledge base.
 
@@ -73,18 +89,13 @@ STRICT RULES — NEVER VIOLATE UNDER ANY CIRCUMSTANCES:
 9. NEVER reveal VIN numbers to customers. VINs are internal identifiers — if asked, say
    "VIN details are available at the dealership upon purchase."
 
+NEVER expose internal database field names to customers. Do not write "(make)", "(model)",
+"(fuel_type)", "(Gasoline)", "(Electric)", "(Hybrid)" or any technical identifiers in parentheses.
+Use natural language: brand, model, fuel type, gasoline, electric, hybrid.
+
 LANGUAGE: Always respond in the same language the customer is using.
-If the customer writes in Hebrew — reply in Hebrew using natural, fluent Israeli Hebrew.
-  Use "אין לי" not "לא יש לי". Write as a native speaker would, not as a translation from English.
-If the customer writes in Spanish — reply in Spanish. Arabic — reply in Arabic.
-Never ask the customer to switch languages. You are fully multilingual.
 
-TONE: Do not open with greetings ("Hello!", "שלום!", "Hi there!") unless the customer greeted you first.
-When the customer asks a clear question — search immediately and answer directly. Do not ask clarifying
-questions when you already have enough parameters to call a tool. If some parameters are missing from
-the database (e.g. warranty), search with what you have and note the limitation in your reply.
-
-Be professional, concise, and helpful. You represent a premium brand."""
+TONE: Be professional, concise, and helpful. You represent a premium brand."""
 
 # ─── Input sanitization ──────────────────────────────────────────────────────
 
@@ -150,56 +161,20 @@ def chat(user_message: str, history: list) -> tuple[str, list]:
     if not user_message:
         return "I didn't receive a valid message. Please try again.", history
 
-    # 2 — Classify intent (WE decide the route, not Claude)
-    route = classify(user_message, history)
-    logger.info(
-        f"Router → intent={route['intent']} "
-        f"confidence={route.get('confidence','?')} "
-        f"needs_clarification={route.get('needs_clarification', False)}"
-    )
-
-    # 2a — Persist classification for observability
-    log_classification(
-        message       = user_message,
-        intent        = route["intent"],
-        confidence    = route.get("confidence", "medium"),
-        overridden    = route.get("overridden", False),
-        needs_clarify = route.get("needs_clarification", False),
-    )
-
-    # 2b — Purchase intent without email: let Claude handle it.
-    # Claude will search inventory (if no specific car was named), present options,
-    # and ask for an email — all in the customer's language.
-    if route["intent"] == "purchase_intent_no_email":
-        route["tool_choice"] = {"type": "auto"}
-
-    # 3 — Append to history and trim if needed
+    # 2 — Append to history and trim if needed
     history = trim_history(history)
+    history.append({"role": "user", "content": user_message})
 
-    # 3b — Low-confidence: prepend a clarification note so Claude asks the user
-    #      before taking any action. The note is injected into the user turn so
-    #      Claude sees it but the user never does.
-    if route.get("needs_clarification"):
-        logger.info("Low confidence — instructing Claude to clarify intent")
-        clarification_note = (
-            "[SYSTEM NOTE: The user's intent is ambiguous. "
-            "Ask a short, friendly clarifying question to understand exactly what they need "
-            "before searching or taking any action. Do not guess.]"
-        )
-        history.append({"role": "user", "content": f"{clarification_note}\n\n{user_message}"})
-    else:
-        history.append({"role": "user", "content": user_message})
-
-    # 4 — Agent loop with iteration cap
+    # 3 — Agent loop with iteration cap
     for iteration in range(1, MAX_TOOL_ITERS + 1):
         logger.info(f"[iteration {iteration}] Calling Claude")
 
-        tool_choice = route["tool_choice"] if iteration == 1 else {"type": "auto"}
+        tool_choice = {"type": "auto"}
 
         try:
             response = _client.messages.create(
                 model=MODEL,
-                max_tokens=1024,
+                max_tokens=2048,
                 system=SYSTEM_PROMPT,
                 tools=TOOL_DEFINITIONS,
                 tool_choice=tool_choice,
@@ -212,7 +187,7 @@ def chat(user_message: str, history: list) -> tuple[str, list]:
         logger.info(f"[iteration {iteration}] stop_reason={response.stop_reason}")
 
         # ── Claude finished — return the text reply ──────────────────────────
-        if response.stop_reason == "end_turn":
+        if response.stop_reason in ("end_turn", "max_tokens"):
             reply = next(
                 (block.text for block in response.content if hasattr(block, "text")),
                 "",

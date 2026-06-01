@@ -98,6 +98,22 @@ def write(sql: str, params: list = None) -> int:
     return execute_write(sql, params)
 
 
+def ensure_reservations_table():
+    """Create reservations table if it doesn't exist. Safe to call on every startup."""
+    pg = is_postgres()
+    pk = "SERIAL PRIMARY KEY" if pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    write(f"""
+        CREATE TABLE IF NOT EXISTS reservations (
+            id         {pk},
+            car_id     INTEGER  NOT NULL,
+            user_name  TEXT     NOT NULL,
+            user_email TEXT     NOT NULL,
+            reserved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at  TIMESTAMP NOT NULL
+        )
+    """)
+
+
 def run_migration():
     if not is_postgres() and DB_PATH.exists():
         print("✓ SQLite DB קיים")
