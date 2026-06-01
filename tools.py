@@ -1,5 +1,5 @@
 """
-tools.py — 4 כלים + router.
+tools.py 
 כל לוגיקה עסקית קריטית רצה כאן בקוד — לא ב-prompt.
 """
 import os
@@ -159,6 +159,21 @@ def _search_inventory(make=None, model=None, year_min=None,
     )
     active_reservations = {r["car_id"]: r["cnt"] for r in res_rows}
 
+    # Fetch earliest expiry per fully-reserved car
+    if is_postgres():
+        expiry_rows = query(
+            f"SELECT car_id, "
+            f"EXTRACT(EPOCH FROM (MIN(expires_at) - NOW()))::int AS seconds_remaining "
+            f"FROM reservations WHERE expires_at > NOW() GROUP BY car_id"
+        )
+    else:
+        expiry_rows = query(
+            f"SELECT car_id, "
+            f"CAST((strftime('%s', MIN(expires_at)) - strftime('%s', 'now')) AS INTEGER) AS seconds_remaining "
+            f"FROM reservations WHERE expires_at > datetime('now') GROUP BY car_id"
+        )
+    earliest_release = {r["car_id"]: max(int(r["seconds_remaining"]), 0) for r in expiry_rows}
+
     results = []
     for car in rows:
         reserved_units   = active_reservations.get(car["id"], 0)
@@ -172,20 +187,38 @@ def _search_inventory(make=None, model=None, year_min=None,
                 "Cannot be sold, reserved, or delivered."
             )
         elif available_units <= 0:
-            car["sellable"]    = False
-            car["status"]      = "out_of_stock" if car["stock_count"] <= 0 else "fully_reserved"
-            car["status_note"] = (
-                "Out of stock — cannot be reserved."
-                if car["stock_count"] <= 0
-                else "All units currently reserved — check back later."
-            )
+            car["sellable"] = False
+            if car["stock_count"] <= 0:
+                car["status"]      = "out_of_stock"
+                car["status_note"] = "Out of stock — cannot be reserved."
+            else:
+                seconds = earliest_release.get(car["id"], 0)
+                hours   = seconds // 3600
+                minutes = (seconds % 3600) // 60
+                car["status"]      = "fully_reserved"
+                car["status_note"] = (
+                    f"All units currently reserved by other buyers. "
+                    f"Earliest release in {hours}h {minutes}m — available then if purchase not completed."
+                )
         else:
             car["sellable"]         = True
             car["status"]           = "available"
             car["status_note"]      = None
+        car["reserved_units"]  = reserved_units
+        car["available_units"] = max(available_units, 0)
         results.append(car)
 
-    return {"success": True, "count": len(results), "results": results}
+    # Hide pending_delisting cars from general results — they should not be proactively shown.
+    # Claude will only learn about them if the customer explicitly asks for a year < 2022.
+    visible = [c for c in results if c["status"] != "pending_delisting"]
+    hidden  = len(results) - len(visible)
+
+    return {
+        "success": True,
+        "count":   len(visible),
+        "results": visible,
+        "pre_2022_units_exist": hidden > 0,
+    }
 
 
 def _search_knowledge_base(query: str) -> dict:
@@ -329,7 +362,7 @@ def _send_purchase_email(user_name: str, user_email: str,
         import resend
         resend.api_key = resend_key
         r = resend.Emails.send({
-            "from":    "sales@premiumcars.com",
+            "from":    "onboarding@resend.dev",
             "to":      [user_email],
             "subject": f"Purchase Inquiry — {car_details}",
             "html":    f"""

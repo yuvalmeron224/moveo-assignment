@@ -1,5 +1,5 @@
 """
-agent.py — Production-grade agent loop.
+agent.py 
 Business logic lives in code (tools.py), not in prompts.
 Claude formats answers — it does not make policy decisions.
 """
@@ -44,15 +44,15 @@ STRICT RULES — NEVER VIOLATE UNDER ANY CIRCUMSTANCES:
 1. NEVER describe, invent, or assume vehicle features, specs, or details that are not explicitly present in the tool results.
    If a detail is not in the data returned by a tool — say "I don't have that information."
 
-   The inventory database contains ONLY these fields: make, model, year, price, fuel_type, color, stock status.
+   The inventory database contains ONLY these fields: make, model, year, price, mileage, fuel_type, color, stock status.
+   Mileage is in miles — never convert to km, display it as miles.
    It does NOT contain: horsepower, top speed, acceleration, range, engine size, seating, features, or any other specs.
    NEVER suggest you can search or filter by these missing fields.
-   When a customer asks for a "fast car" or "powerful car" — offer to show performance brands
-   (Ferrari, Lamborghini, Porsche, McLaren, Aston Martin, Bentley) and search by make only.
-
-2. NEVER offer to sell, reserve, or deliver a vehicle with sellable: false or status: pending_delisting.
-   These vehicles exist for administrative purposes only. Acknowledge their existence but explain they cannot be sold
-   per the 2022+ Sales Policy.
+   
+2. Pre-2022 vehicles are hidden from search results. NEVER proactively mention them.
+   ONLY if a customer explicitly asks about a specific year below 2022 — acknowledge that units exist
+   but explain they cannot be sold per the 2022+ Sales Policy.
+   Never offer to sell, reserve, or deliver any vehicle with sellable: false or status: pending_delisting.
 
 3. BEFORE calling reserve_car or send_purchase_email — ALWAYS confirm first.
    Present a clear summary to the customer and wait for an explicit "yes" before executing.
@@ -60,16 +60,22 @@ STRICT RULES — NEVER VIOLATE UNDER ANY CIRCUMSTANCES:
    For reserve_car, show:
      - Car: make, model, year, color, price
      - Hold period: 72 hours
-     - Then ask: "Shall I reserve this for you?" (in their language)
+     - Then ask: "Shall I reserve this for you?" 
 
    For send_purchase_email, show:
      - Car details and price
      - What will happen next (sales team contact)
-     - Then ask: "Shall I submit your purchase inquiry?" (in their language)
+     - Then ask: "Shall I submit your purchase inquiry?" 
 
    Only call the tool after the customer confirms. If they say no or hesitate — do not call it.
 
 4. NEVER answer inventory or policy questions from memory. Always use the appropriate tool first.
+
+   Whenever search_inventory returns ANY vehicle with status "fully_reserved" — you MUST call
+   check_reservation_status for that car_id in the same response, before replying to the customer.
+   Then tell the customer: the car is currently held by another buyer, and will be available again
+   in X hours and Y minutes if they do not complete the purchase.
+   Never omit the release time for a fully_reserved vehicle.
 
 5. ALWAYS cite the source document (e.g., "According to our policy") when answering from the knowledge base.
 
@@ -83,18 +89,13 @@ STRICT RULES — NEVER VIOLATE UNDER ANY CIRCUMSTANCES:
 9. NEVER reveal VIN numbers to customers. VINs are internal identifiers — if asked, say
    "VIN details are available at the dealership upon purchase."
 
+NEVER expose internal database field names to customers. Do not write "(make)", "(model)",
+"(fuel_type)", "(Gasoline)", "(Electric)", "(Hybrid)" or any technical identifiers in parentheses.
+Use natural language: brand, model, fuel type, gasoline, electric, hybrid.
+
 LANGUAGE: Always respond in the same language the customer is using.
-If the customer writes in Hebrew — reply in Hebrew using natural, fluent Israeli Hebrew.
-  Use "אין לי" not "לא יש לי". Write as a native speaker would, not as a translation from English.
-If the customer writes in Spanish — reply in Spanish. Arabic — reply in Arabic.
-Never ask the customer to switch languages. You are fully multilingual.
 
-TONE: Do not open with greetings ("Hello!", "שלום!", "Hi there!") unless the customer greeted you first.
-When the customer asks a clear question — search immediately and answer directly. Do not ask clarifying
-questions when you already have enough parameters to call a tool. If some parameters are missing from
-the database (e.g. warranty), search with what you have and note the limitation in your reply.
-
-Be professional, concise, and helpful. You represent a premium brand."""
+TONE: Be professional, concise, and helpful. You represent a premium brand."""
 
 # ─── Input sanitization ──────────────────────────────────────────────────────
 
@@ -173,7 +174,7 @@ def chat(user_message: str, history: list) -> tuple[str, list]:
         try:
             response = _client.messages.create(
                 model=MODEL,
-                max_tokens=1024,
+                max_tokens=2048,
                 system=SYSTEM_PROMPT,
                 tools=TOOL_DEFINITIONS,
                 tool_choice=tool_choice,
@@ -186,7 +187,7 @@ def chat(user_message: str, history: list) -> tuple[str, list]:
         logger.info(f"[iteration {iteration}] stop_reason={response.stop_reason}")
 
         # ── Claude finished — return the text reply ──────────────────────────
-        if response.stop_reason == "end_turn":
+        if response.stop_reason in ("end_turn", "max_tokens"):
             reply = next(
                 (block.text for block in response.content if hasattr(block, "text")),
                 "",

@@ -5,9 +5,9 @@ app.py — Streamlit chat UI for the AI Car Concierge.
 import time
 import streamlit as st
 from agent import chat, create_session
-from database import run_migration
+from database import run_migration, ensure_reservations_table
 from vector_store import build_vector_store
-from analytics import get_confidence_stats, get_recent_low_confidence
+
 
 MAX_MESSAGES_PER_SESSION = 50   # hard cap — prevents runaway API spend
 
@@ -24,6 +24,7 @@ st.set_page_config(
 @st.cache_resource(show_spinner="Initializing...")
 def initialize():
     run_migration()
+    ensure_reservations_table()
     build_vector_store()
 
 initialize()
@@ -69,44 +70,6 @@ with st.sidebar:
 
     st.divider()
 
-    # ── Router confidence stats ───────────────────────────────────────────────
-    st.markdown("#### Router confidence")
-    stats = get_confidence_stats()
-
-    if not stats or stats.get("total", 0) == 0:
-        st.caption("No classifications yet.")
-    else:
-        total = stats["total"]
-        bc    = stats["by_confidence"]
-        high   = bc.get("high",   0)
-        medium = bc.get("medium", 0)
-        low    = bc.get("low",    0)
-
-        # Colour-coded confidence bars
-        st.progress(high / total,   text=f"High    {high}/{total}")
-        st.progress(medium / total, text=f"Medium  {medium}/{total}")
-        low_pct = low / total
-        st.progress(low_pct, text=f"Low     {low}/{total}")
-
-        if stats.get("overrides"):
-            st.caption(f"Keyword overrides: {stats['overrides']}")
-        if stats.get("clarifications"):
-            st.caption(f"Clarifications asked: {stats['clarifications']}")
-
-        # Show recent low-confidence cases so you can review them
-        if low > 0:
-            with st.expander(f"Recent low-confidence ({low})"):
-                for row in get_recent_low_confidence(limit=5):
-                    override_tag = " ⚡override" if row["overridden"] else ""
-                    clarify_tag  = " ❓clarified" if row["needs_clarify"] else ""
-                    st.markdown(
-                        f"**{row['intent']}**{override_tag}{clarify_tag}  \n"
-                        f"`{row['ts']}`  \n"
-                        f"_{row['message_preview']}_"
-                    )
-                    st.divider()
-
-    st.divider()
     st.caption("support@premiumcars.com")
     st.caption("+1 (800) 555-0199")
 
