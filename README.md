@@ -245,3 +245,9 @@ The app will automatically:
 
 ---
 
+## Live Demo
+
+**[https://truthful-cooperation-production-c52b.up.railway.app](https://truthful-cooperation-production-c52b.up.railway.app)**
+
+Hosted on Railway. No setup required — the app connects to the production Supabase database and ChromaDB vector store automatically.
+
