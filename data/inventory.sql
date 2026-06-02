@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS vehicles (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    id          SERIAL PRIMARY KEY,
     make        TEXT NOT NULL,
     model       TEXT NOT NULL,
     year        INTEGER NOT NULL,
@@ -9,6 +9,15 @@ CREATE TABLE IF NOT EXISTS vehicles (
     color       TEXT NOT NULL,
     stock_count INTEGER NOT NULL DEFAULT 1 CHECK(stock_count >= 0),
     vin         TEXT UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS reservations (
+    id          SERIAL PRIMARY KEY,
+    car_id      INTEGER NOT NULL,
+    user_name   TEXT NOT NULL,
+    user_email  TEXT NOT NULL,
+    reserved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at  TIMESTAMP NOT NULL
 );
 
 INSERT INTO vehicles (make, model, year, price, mileage, fuel_type, color, stock_count, vin) VALUES

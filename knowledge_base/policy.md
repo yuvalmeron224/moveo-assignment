@@ -38,3 +38,4 @@ All vehicles sold by our dealership must meet the following standards:
 - We accept trade-ins for vehicles model year 2018 or newer in good condition.
 - Trade-in valuations are valid for 7 days from the date of appraisal.
 - Trade-in value is applied as a direct discount against the purchase price.
+

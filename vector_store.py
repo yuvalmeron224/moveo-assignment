@@ -1,7 +1,7 @@
 """
-vector_store.py — RAG layer.
+vector_store.py
 Embeddings: Voyage AI (production) / hash fallback (dev without key).
-Store: ChromaDB persistent.
+Store: ChromaDB persistent, chunked by ## headers.
 """
 import os
 import re
